@@ -1,4 +1,4 @@
-﻿﻿﻿﻿import { useState, useEffect } from 'react'
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Gear, ChartLine, Scroll, Spinner, Sun, Moon, ChatCircleDots, Star, Eye, Newspaper, Chats, PaperPlaneTilt, Bell, QrCode, X, PuzzlePiece, Clock, Microphone } from '@phosphor-icons/react'
 import { API_BASE, getWsUrl } from './components/SharedComponents'
@@ -301,11 +301,17 @@ export default function App() {
 
   // Onboarding
   if (!onboardingDone) {
-    return <Onboarding onComplete={() => { setShowGuide(true); setOnboardingDone(true) }} />
+    return <Onboarding onComplete={() => {
+      setShowGuide(true)
+      setOnboardingDone(true)
+      // 引导完成后立刻拉起 Bot：服务端已在 step4 重建共享客户端，
+      // 新凭证/新目录可以直接生效，不需要重启应用。
+      fetch(`${API_BASE}/api/start`, { method: 'POST' }).catch(() => {})
+    }} />
   }
 
   return (
-    <div className="min-h-[100dvh] bg-bg-main text-text-main font-sans transition-colors duration-200 relative overflow-hidden">
+    <div className="min-h-[100dvh] bg-bg-main text-text-main font-sans transition-colors duration-200 relative overflow-x-clip">
       {/* Ambient wave background */}
       <AmbientWaveBackground />
 

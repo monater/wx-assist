@@ -151,6 +151,47 @@ def _set_env_key(env_path: Path, key: str, value: str) -> None:
     write_env_atomic(env_path, {key: value})
 
 
+def _stored_key_invalid() -> bool:
+    """已保存的 WCDB_KEY 能否通过首页 HMAC 校验。
+
+    只在「能定位到 session.db（微信 4.x 账号库）且校验明确失败」时返回
+    True。以下情况一律返回 False，宁可留在工作台也不误判：
+    - 找不到库文件（可能是自定义目录未配置，属于"选目录"问题而非密钥问题）
+    - 库是微信 3.x 的 MSG*.db（没有可校验的首页 HMAC）
+    - 读文件抛异常（被占用/权限/IO 抖动）
+    """
+    try:
+        import os as _os
+
+        key = (_os.environ.get("WCDB_KEY", "") or "").strip()
+        if not key:
+            return False
+
+        # 优先用 .env 里配置的 DB_PATH（Bot 实际就按它打开），
+        # 避免多账号时按修改时间自动探测到另一个账号、把有效密钥误判成失效。
+        target = None
+        db_path = (_os.environ.get("DB_PATH", "") or "").strip()
+        if db_path:
+            p = Path(db_path)
+            if p.exists() and p.is_file() and p.name.lower() == "session.db":
+                target = p
+        if target is None:
+            _wxid, detected, _base = _detect_wxid_and_db_path()
+            if detected:
+                p = Path(detected)
+                if p.name.lower() == "session.db":
+                    target = p
+        if target is None:
+            return False
+
+        from src.wechat import db_crypto
+
+        km = db_crypto.parse_key(key)
+        return not db_crypto.verify_key(km, target)
+    except Exception:
+        return False
+
+
 def _infer_data_dir_from_dbpath(db_path: str) -> str:
     """From a db_path, locate the enclosing WeChat account directory
     (identified by internal structure, not by name), then return its
@@ -225,6 +266,9 @@ def _run_step1_extraction():
             _set_env_key(env_path, "WCDB_KEY", key)
             import os as _os
             _os.environ["WCDB_KEY"] = key
+            # 拿到密钥就等于 KEY_MISSING 已经解决，不管后面目录探测是否成功都要清掉
+            # 这条错误，否则界面会一直顶着"未连接"的红条。
+            update_status(error="")
 
             # Check if wxid/db_path auto-detection succeeded
             skip_step2 = False
@@ -254,9 +298,6 @@ def _run_step1_extraction():
                     _onboarding_data["wxid"] = wxid or ""
                     _onboarding_data["db_path"] = db_path or ""
                     _onboarding_data["wechat_data_dir"] = base_dir or ""
-
-                # Clear the KEY_MISSING error so it doesn't reappear on page refresh
-                update_status(error="")
 
                 with _step1_lock:
                     _step1_state["phase"] = "done"
@@ -2003,7 +2044,10 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 from src.config import load_config
                 # A 档 edge-tts 语速（仅 edge 通道生效，其它通道内部忽略该参数）
                 rate = getattr(load_config(), "voice_tts_rate", "+0%") or "+0%"
+                tts_t0 = time.monotonic()
                 audio, audio_type = synthesize(text[:1000], voice=voice, rate=rate)
+                logger.info("[VOICE-A] tts ok in %.0fms bytes=%d text=%s",
+                            (time.monotonic() - tts_t0) * 1000, len(audio), text[:40])
                 self.send_response(200)
                 self.send_header("Content-Type", audio_type)
                 self.send_header("Content-Length", str(len(audio)))
@@ -3073,8 +3117,12 @@ class _UIHandler(SimpleHTTPRequestHandler):
 
         # ── API: Onboarding status ────────────────────────────────────
         if self.path == "/api/onboarding/status":
-            from src.config import is_onboarding_done
-            done = is_onboarding_done()
+            from src.config import is_wechat_ready
+            done = is_wechat_ready()
+            # 有密钥但校验不过（换账号/微信升级导致 key 失效）→ 回引导重新提取
+            if done and _stored_key_invalid():
+                logger.info("Onboarding status: 已保存的密钥无效，回到引导流程")
+                done = False
             with _onboarding_lock:
                 steps = {
                     "step1": _onboarding_data["step1_done"],
@@ -3317,6 +3365,26 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 # the auto-created .env.example; this refresh overrides them.)
                 from dotenv import load_dotenv as _load_dotenv
                 _load_dotenv(env_path, override=True)
+
+                # 新凭证/新目录立刻生效：重建进程级共享客户端。
+                # 不重建的话，本进程里那个单例还揣着旧 key，
+                # 后续启动 Bot 依然会报 KEY_MISSING（只能靠重启应用解决）。
+                try:
+                    if _bot_control.is_running():
+                        # 运行中的 Bot 正握着这个客户端，贸然关闭会让它立刻报
+                        # "读取器未初始化"；这种情况让用户手动重启服务即可。
+                        logger.info("Onboarding step4: Bot 运行中，跳过共享客户端重建")
+                    else:
+                        from src.wechat.wcdb_client import reset_shared_client
+                        reset_shared_client()
+                except Exception as _e:             # noqa: BLE001
+                    logger.warning("Onboarding step4: reset shared client failed: %s", _e)
+                try:
+                    from src.web.api_handlers import reset_wcdb_client
+                    reset_wcdb_client()
+                except Exception as _e:             # noqa: BLE001
+                    logger.debug("Onboarding step4: reset cached refs failed: %s", _e)
+                update_status(error="")
                 self.send_json({"ok": True})
             except Exception as e:
                 logger.exception("Onboarding step4 failed")
@@ -3325,11 +3393,17 @@ class _UIHandler(SimpleHTTPRequestHandler):
 
         # ── API: Reset onboarding → allow re-extraction ─────────────
         if self.path == "/api/onboarding/reset":
-            # 1. Reset file-based state
+            # 1. Reset file-based state.
+            #    只把引导标记置回 false，**不清 WCDB_KEY**：用户可能只是点错，
+            #    或者重新提取失败；留着旧 key 至少不会把环境弄得更差。
             env_path = _find_or_create_env()
             _set_env_key(env_path, "ONBOARDING_DONE", "false")
-            _set_env_key(env_path, "WCDB_KEY", "")
-            # 2. Reset in-memory state so a fresh extraction can start
+            # 2. 正在跑的 Bot 用的是旧凭证，先停掉，避免它继续拿旧 key 读库
+            try:
+                _stop_bot()
+            except Exception as _e:                 # noqa: BLE001
+                logger.debug("reset onboarding: stop bot failed: %s", _e)
+            # 3. Reset in-memory state so a fresh extraction can start
             with _onboarding_lock:
                 for k in _onboarding_data:
                     if isinstance(_onboarding_data[k], bool):
@@ -3619,14 +3693,41 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 status=(qs.get("status") or [""])[0],
                 limit=limit,
             )
+            # Per-platform delivery outcomes drive the badges on each card;
+            # push_status alone cannot say which channel succeeded.
+            try:
+                from src.im.delivery import get_delivery_service
+                grouped = get_delivery_service().attempts_for_outbox(
+                    [row.get("id") for row in notifications],
+                )
+                for row in notifications:
+                    row["push_attempts"] = grouped.get(int(row.get("id") or 0), [])
+            except Exception as exc:
+                logger.warning("Load push attempts failed: %s", exc)
+                for row in notifications:
+                    row.setdefault("push_attempts", [])
             self.send_json({"ok": True, "notifications": notifications})
             return
 
         # ── API: Assistant — pending notifications ──────────────────────
-        if self.path == "/api/assistant/notifications/pending":
+        if self.path.startswith("/api/assistant/notifications/pending"):
+            from urllib.parse import urlparse, parse_qs
             from src.assistant.outbox import Outbox
-            outbox = Outbox()
-            pending = outbox.get_pending(limit=20)
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+
+            def _int_param(name, default, low, high):
+                try:
+                    value = int((qs.get(name) or [default])[0])
+                except (TypeError, ValueError):
+                    value = default
+                return max(low, min(value, high))
+
+            pending = Outbox().get_pending(
+                limit=_int_param("limit", 20, 1, 200),
+                notif_type=(qs.get("type") or [""])[0],
+                since_id=_int_param("since_id", 0, 0, 2**53),
+            )
             self.send_json({"ok": True, "notifications": pending})
             return
 
