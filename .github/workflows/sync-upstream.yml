@@ -27,5 +27,5 @@ jobs:
           git fetch upstream master
 
           git switch master
-          git merge --ff-only upstream/master
+          git merge --no-edit upstream/master
           git push origin master
