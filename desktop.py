@@ -592,4 +592,30 @@ def main():
 
 
 if __name__ == "__main__":
+    # PyInstaller worker processes must enter multiprocessing before starting UI.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    if "--check-rag" in sys.argv:
+        # 离线自检：只在临时目录建索引，不碰真实数据，可在打包版直接运行。
+        import json
+        from pathlib import Path
+
+        target = (Path(sys.executable).parent if getattr(sys, "frozen", False) else Path.cwd())
+        out_path = target / "rag-check.json"
+        try:
+            from src.assistant.rag.diagnostics import run_check
+        except Exception as exc:
+            # 轻量版没有 RAG 组件：给出明确结果，而不是静默崩溃
+            report = {"ok": False, "error": f"当前版本不包含 RAG 组件: {exc}"}
+        else:
+            report = run_check(keep="--keep" in sys.argv)
+
+        try:
+            out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        print(json.dumps(report, ensure_ascii=False))
+        raise SystemExit(0 if report.get("ok") else 2)
+
     main()
